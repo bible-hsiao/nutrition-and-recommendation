@@ -1,0 +1,923 @@
+import base64
+import importlib
+import os
+import sys
+import unittest
+from datetime import datetime, timedelta, timezone
+
+from services.app_time_service import app_now
+from unittest.mock import patch
+
+
+class ApiTestBase(unittest.TestCase):
+    """共用的 app 啟動與登入輔助。
+
+    測試類別彼此繼承會把父類別的測試全部再跑一遍，所以骨架放這裡，
+    各組測試只繼承骨架。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ["SUPABASE_AUTH_REQUIRED"] = "true"
+        os.environ["SUPABASE_URL"] = "https://example.supabase.co"
+        os.environ["SUPABASE_PUBLISHABLE_KEY"] = "test-publishable-key"
+        sys.modules.pop("app", None)
+        cls.app_module = importlib.import_module("app")
+        cls.app_module.app.config["TESTING"] = True
+
+    def setUp(self):
+        self.client = self.app_module.app.test_client()
+        self.app_module._mem_users.clear()
+        self.app_module._mem_records.clear()
+        self.app_module._mem_custom_foods.clear()
+        # 菜單快取掛在 storage 上，不清會從別的測試漏過來
+        self.app_module.storage.mem_restaurant_menus.clear()
+        self.app_module.storage.upsert_user({"user_id": "user-a", "name": "User A", "health_conditions": ["hypertension"], "allergens": ["egg"]})
+
+    def auth_headers(self):
+        return {"Authorization": "Bearer test-token"}
+
+    def mock_auth(self, user_id="user-a"):
+        return patch.object(self.app_module, "verify_supabase_user", return_value={"id": user_id})
+
+    def _seed_menu(self, name, address, text, deadline=None):
+        return {
+            "items": [
+                {
+                    "item_id": f"{name}_{index}",
+                    "name": f"{name} 餐點{index}",
+                    "price": 110 + index,
+                    "calories": 500,
+                    "protein": 25,
+                    "carbs": 55,
+                    "fat": 16,
+                    "sugar": 3,
+                    "saturated_fat": 4,
+                    "trans_fat": 0,
+                    "fiber": 5,
+                    "sodium": 600,
+                }
+                for index in range(4)
+            ]
+        }
+
+
+class ApiRouteTests(ApiTestBase):
+    def test_medical_metadata_route_exposes_governance_metadata(self):
+        response = self.client.get("/medical-metadata")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertIn("disease_rules", data)
+        self.assertIn("allergen_taxonomy", data)
+        self.assertGreater(data["disease_rules"]["count"], 0)
+        self.assertGreater(data["allergen_taxonomy"]["count"], 0)
+
+    def test_user_route_rejects_missing_token_when_auth_required(self):
+        response = self.client.get("/user/user-a")
+        self.assertEqual(response.status_code, 401)
+
+    def test_user_route_rejects_cross_user_access(self):
+        with self.mock_auth("user-a"):
+            response = self.client.get("/user/user-b", headers=self.auth_headers())
+        self.assertEqual(response.status_code, 403)
+
+    def test_vision_food_accepts_raw_base64_and_browser_data_uri(self):
+        image_base64 = base64.b64encode(b"\x89PNG\r\n\x1a\nmock-image").decode("ascii")
+
+        for image_payload in (image_base64, f"data:image/png;base64,{image_base64}"):
+            with self.subTest(data_uri=image_payload.startswith("data:")):
+                with self.mock_auth("user-a"):
+                    with patch.object(self.app_module, "get_gemini_api_keys", return_value=["test-key"]):
+                        with patch.object(
+                            self.app_module,
+                            "call_gemini_food_recognition_with_rotation",
+                            return_value={"items": []},
+                        ) as recognize:
+                            response = self.client.post(
+                                "/predict/vision-food",
+                                json={"image": image_payload, "user_id": "user-a"},
+                                headers=self.auth_headers(),
+                            )
+
+                self.assertEqual(response.status_code, 200)
+                recognize.assert_called_once_with(image_base64, "image/png", ["test-key"])
+
+    def test_vision_food_rejects_invalid_image_payloads(self):
+        invalid_payloads = ("", "not-base64", "data:text/plain;base64,SGVsbG8=")
+
+        for image_payload in invalid_payloads:
+            with self.subTest(image_payload=image_payload):
+                response = self.client.post("/predict/vision-food", json={"image": image_payload})
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("error", response.get_json())
+
+    def test_menu_photo_route_exposes_recognition_failure(self):
+        image_base64 = base64.b64encode(b"\x89PNG\r\n\x1a\nmenu-image").decode("ascii")
+        parsed = {
+            "items": [],
+            "recognition_status": "error",
+            "recognition_error": "Gemini HTTP 429: quota exceeded",
+        }
+
+        with self.mock_auth("user-a"):
+            with patch.object(self.app_module, "parse_menu_image_with_gemini", return_value=parsed):
+                response = self.client.post(
+                    "/restaurant/menu",
+                    json={
+                        "restaurant_id": "menu-test-restaurant",
+                        "name": "測試菜單辨識店",
+                        "user_id": "user-a",
+                        "menu_image": image_base64,
+                    },
+                    headers=self.auth_headers(),
+                )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["recommended_items"], [])
+        self.assertEqual(data["menu_recognition"]["recognition_status"], "error")
+        self.assertIn("429", data["menu_recognition"]["recognition_error"])
+
+    def test_menu_route_blocks_a_dish_the_disease_rules_reject(self):
+        """/restaurant/menu 必須真的擋掉疾病禁忌，不是只擋超出預算的。
+
+        先前這裡判斷的是 medical_risk.get("action") == "BLOCK"，
+        但 evaluate_medical_risk 沒有 action 這個鍵，所以恆為 False：
+        一份 1500mg 鈉的炸雞排會被放進推薦區，旁邊還寫「判定依據：
+        符合單餐預算」，而算好的 block_reasons 整個被丟掉。
+        user-a 在 setUp 裡就有高血壓。
+        """
+        parsed = {
+            "items": [
+                {
+                    "item_id": "salty",
+                    "name": "炸雞排便當",
+                    "price": 100,          # 預算內，所以只有疾病規則能擋它
+                    "calories": 700,
+                    "protein": 30,
+                    "carbs": 60,
+                    "fat": 30,
+                    "sugar": 3,
+                    "saturated_fat": 8,
+                    "trans_fat": 2.0,
+                    "fiber": 3,
+                    "sodium": 1500,
+                    "is_fried": True,
+                },
+                {
+                    "item_id": "mild",
+                    "name": "清蒸雞肉飯",
+                    "price": 100,
+                    "calories": 500,
+                    "protein": 25,
+                    "carbs": 55,
+                    "fat": 10,
+                    "sugar": 2,
+                    "saturated_fat": 3,
+                    "trans_fat": 0,
+                    "fiber": 5,
+                    "sodium": 400,
+                    "is_fried": False,
+                },
+            ],
+        }
+
+        # 先建檔進菜單快取，路由就會直接讀它，不會去呼叫 Gemini。
+        self.app_module.storage.save_restaurant_menu(
+            "重鹹便當店", parsed["items"], venue={"address": "台北市", "lat": 25.03, "lng": 121.56}
+        )
+
+        with self.mock_auth("user-a"):
+            response = self.client.post(
+                "/restaurant/menu",
+                json={
+                    "restaurant_id": "sodium-test",
+                    "name": "重鹹便當店",
+                    "user_id": "user-a",
+                    "budget": 150,
+                },
+                headers=self.auth_headers(),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        recommended = [item["item_name"] for item in data["recommended_items"]]
+        filtered = [item["item_name"] for item in data["filtered_items"]]
+
+        self.assertNotIn("炸雞排便當", recommended)
+        self.assertIn("炸雞排便當", filtered)
+        self.assertIn("清蒸雞肉飯", recommended)
+
+        blocked = next(item for item in data["filtered_items"] if item["item_name"] == "炸雞排便當")
+        self.assertTrue(blocked["reasons"], "被擋下來卻沒有給任何理由")
+        self.assertTrue(
+            any("鈉" in reason for reason in blocked["reasons"]),
+            f"理由裡沒有提到鈉：{blocked['reasons']}",
+        )
+
+    def test_record_route_deduplicates_client_record_id(self):
+        payload = {
+            "user_id": "user-a",
+            "client_record_id": "client-record-1",
+            "meal_type": "午餐",
+            "foods": [{"name": "apple", "calories": 80}],
+            "total_calories": 80,
+            "source": "manual",
+        }
+
+        with self.mock_auth("user-a"):
+            first_response = self.client.post("/record", json=payload, headers=self.auth_headers())
+            second_response = self.client.post("/record", json=payload, headers=self.auth_headers())
+            records_response = self.client.get("/records/user-a", headers=self.auth_headers())
+
+        self.assertEqual(first_response.status_code, 201)
+        self.assertFalse(first_response.get_json()["deduplicated"])
+        self.assertEqual(second_response.status_code, 200)
+        self.assertTrue(second_response.get_json()["deduplicated"])
+        self.assertEqual(len(records_response.get_json()["records"]), 1)
+
+    def test_record_route_generates_client_record_id_when_missing(self):
+        payload = {
+            "user_id": "user-a",
+            "meal_type": "午餐",
+            "foods": [{"name": "apple", "calories": 80}],
+            "total_calories": 80,
+            "source": "manual",
+        }
+
+        with self.mock_auth("user-a"):
+            response = self.client.post("/record", json=payload, headers=self.auth_headers())
+
+        self.assertEqual(response.status_code, 201)
+        data = response.get_json()
+        self.assertFalse(data["deduplicated"])
+        self.assertTrue(data["record"]["client_record_id"].startswith("server_record_"))
+
+    def test_record_route_creates_today_and_historical_manual_records(self):
+        local_timezone = timezone(timedelta(hours=8))
+        local_now = datetime.now(local_timezone)
+        timestamps = (
+            local_now.replace(microsecond=123000).isoformat(),
+            (local_now - timedelta(days=45)).replace(microsecond=456000).isoformat(),
+        )
+
+        for index, timestamp in enumerate(timestamps):
+            with self.subTest(timestamp=timestamp):
+                payload = {
+                    "user_id": "user-a",
+                    "client_record_id": f"manual-date-{index}",
+                    "timestamp": timestamp,
+                    "foods": [{
+                        "name": "  手動豆漿  ",
+                        "calories": 120,
+                        "protein": 8.5,
+                        "carbs": 10,
+                        "fat": 4,
+                        "sodium": 95,
+                        "fiber": 2,
+                    }],
+                    "source": "manual",
+                }
+                with self.mock_auth("user-a"):
+                    response = self.client.post("/record", json=payload, headers=self.auth_headers())
+
+                self.assertEqual(response.status_code, 201)
+                record = response.get_json()["record"]
+                self.assertEqual(record["timestamp"], timestamp)
+                self.assertEqual(record["foods"][0]["name"], "手動豆漿")
+                self.assertEqual(record["source"], "manual")
+                self.assertEqual(record["meal_type"], "午餐")
+
+    def test_record_route_rejects_future_calendar_date(self):
+        local_timezone = timezone(timedelta(hours=8))
+        future_timestamp = (datetime.now(local_timezone) + timedelta(days=1)).isoformat()
+        payload = {
+            "user_id": "user-a",
+            "client_record_id": "future-manual-record",
+            "timestamp": future_timestamp,
+            "foods": [{"name": "未來餐點", "calories": 100}],
+            "source": "manual",
+        }
+
+        with self.mock_auth("user-a"):
+            response = self.client.post("/record", json=payload, headers=self.auth_headers())
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error"], "紀錄日期不得晚於今天")
+        self.assertIsNone(self.app_module.storage.get_record_by_client_record_id("user-a", "future-manual-record"))
+
+    def test_record_route_rejects_invalid_food_values(self):
+        invalid_foods = (
+            [{"name": "   ", "calories": 80}],
+            [{"name": "豆漿", "calories": "not-a-number"}],
+            [{"name": "豆漿", "sodium": -1}],
+        )
+
+        for index, foods in enumerate(invalid_foods):
+            with self.subTest(foods=foods):
+                with self.mock_auth("user-a"):
+                    response = self.client.post(
+                        "/record",
+                        json={
+                            "user_id": "user-a",
+                            "client_record_id": f"invalid-create-{index}",
+                            "foods": foods,
+                            "source": "manual",
+                        },
+                        headers=self.auth_headers(),
+                    )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("error", response.get_json())
+
+    def _seed_places(self, names):
+        return [
+            {
+                "restaurant_id": f"google_{name}",
+                "name": name,
+                "address": "台北",
+                "tags": ["Google Places"],
+            }
+            for name in names
+        ]
+
+    def _index_two_venues(self, names=("真實店家 A", "真實店家 B")):
+        with patch.object(
+            self.app_module, "fetch_google_places_restaurants",
+            lambda *a, **k: self._seed_places(names),
+        ), patch.object(self.app_module, "enrich_restaurant_with_gemini", self._seed_menu):
+            return self.client.post("/restaurants/index/user-a", json={}, headers=self.auth_headers())
+
+    def test_menu_cache_is_keyed_on_place_id_not_the_venue_name(self):
+        """Places 新舊版 API 回的店名可能不同，用店名當 key 會重複分析。"""
+        storage = self.app_module.storage
+        storage.save_restaurant_menu(
+            "阿宏便當",
+            [{"name": "雞腿便當", "calories": 700, "protein": 30, "carbs": 80, "fat": 22, "fiber": 4, "sodium": 800}],
+            venue={"google_place_id": "place-xyz"},
+        )
+        # 同一家店，另一版 API 給了不同的店名，但 place_id 一樣
+        self.assertIsNotNone(storage.get_restaurant_menu("阿宏便當 板橋店", "place-xyz"))
+        # 沒有 place_id 時仍可用店名找回來
+        self.assertIsNotNone(storage.get_restaurant_menu("阿宏便當"))
+        self.assertIsNone(storage.get_restaurant_menu("完全不同的店", "place-other"))
+
+    def test_restaurant_index_builds_the_cache_and_skips_known_venues(self):
+        """建檔是獨立動作：第二次按時已建檔的店家不該再送去分析。"""
+        calls = []
+
+        def counting_menu(name, address, text, deadline=None):
+            calls.append(name)
+            return self._seed_menu(name, address, text, deadline)
+
+        with self.mock_auth("user-a"):
+            with patch.object(
+                self.app_module, "fetch_google_places_restaurants",
+                lambda *a, **k: self._seed_places(["建檔店 A", "建檔店 B"]),
+            ), patch.object(self.app_module, "enrich_restaurant_with_gemini", counting_menu):
+                first = self.client.post(
+                    "/restaurants/index/user-a", json={}, headers=self.auth_headers()
+                )
+                second = self.client.post(
+                    "/restaurants/index/user-a", json={}, headers=self.auth_headers()
+                )
+
+        self.assertEqual(first.status_code, 200)
+        first_body = first.get_json()
+        self.assertEqual(first_body["analysed"], 2)
+        self.assertEqual(first_body["already_cached"], 0)
+
+        second_body = second.get_json()
+        self.assertEqual(second_body["analysed"], 0)
+        self.assertEqual(second_body["already_cached"], 2)
+        self.assertEqual(len(calls), 2, f"第二次不該再分析：{calls}")
+
+    def test_restaurant_index_reports_when_nothing_is_nearby(self):
+        with self.mock_auth("user-a"):
+            with patch.object(
+                self.app_module, "fetch_google_places_restaurants", lambda *a, **k: []
+            ):
+                response = self.client.post(
+                    "/restaurants/index/user-a", json={}, headers=self.auth_headers()
+                )
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("搜尋不到店家", response.get_json()["error"])
+
+    def test_record_route_recalculates_totals_instead_of_trusting_payload(self):
+        payload = {
+            "user_id": "user-a",
+            "client_record_id": "manual-recalculated-record",
+            "foods": [
+                {
+                    "name": "炸豆腐",
+                    "calories": 120,
+                    "protein": 8.5,
+                    "carbs": 10,
+                    "refined_sugar": 1.5,
+                    "fat": 4,
+                    "saturated_fat": 0.8,
+                    "trans_fat": 0,
+                    "sodium": 95,
+                    "fiber": 2,
+                    "is_fried": True,
+                },
+                {
+                    "name": "香蕉",
+                    "calories": 90,
+                    "protein": 1,
+                    "carbs": 23,
+                    "sugar": 4.2,
+                    "fat": 0.3,
+                    "saturated_fat": 0.1,
+                    "trans_fat": 0,
+                    "sodium": 1,
+                    "fiber": 2.6,
+                    "is_fried": False,
+                },
+            ],
+            "total_calories": 9999,
+            "total_protein": 9999,
+            "total_sodium": 9999,
+            "source": "manual",
+        }
+
+        with self.mock_auth("user-a"):
+            response = self.client.post("/record", json=payload, headers=self.auth_headers())
+
+        self.assertEqual(response.status_code, 201)
+        record = response.get_json()["record"]
+        self.assertEqual(record["total_calories"], 210)
+        self.assertEqual(record["total_protein"], 9.5)
+        self.assertEqual(record["total_sodium"], 96)
+        self.assertEqual(record["total_fiber"], 4.6)
+        self.assertEqual(record["total_sugar"], 5.7)
+        self.assertEqual(record["total_saturated_fat"], 0.9)
+        self.assertEqual(record["total_trans_fat"], 0)
+        self.assertTrue(record["contains_fried_food"])
+        self.assertEqual(record["foods"][0]["sugar"], 1.5)
+
+    def test_record_route_keeps_existing_scanner_creation_compatible(self):
+        payload = {
+            "user_id": "user-a",
+            "client_record_id": "scanner-compatible-record",
+            "meal_type": "點心",
+            "foods": [{"name": "掃描蘋果", "calories": 80, "source": "camera"}],
+            "total_calories": 999,
+            "source": "camera",
+        }
+
+        with self.mock_auth("user-a"):
+            response = self.client.post("/record", json=payload, headers=self.auth_headers())
+
+        self.assertEqual(response.status_code, 201)
+        record = response.get_json()["record"]
+        self.assertEqual(record["meal_type"], "點心")
+        self.assertEqual(record["source"], "camera")
+        self.assertEqual(record["total_calories"], 80)
+        self.assertTrue(record["timestamp"])
+
+    def test_records_route_paginates_in_newest_first_order(self):
+        for index in range(1, 4):
+            self.app_module.storage.insert_record({
+                "user_id": "user-a",
+                "client_record_id": f"record-{index}",
+                "timestamp": f"2026-08-0{index}T12:00:00Z",
+                "foods": [],
+                "total_calories": index * 100,
+            })
+
+        with self.mock_auth("user-a"):
+            first_page = self.client.get("/records/user-a?limit=2&offset=0", headers=self.auth_headers())
+            second_page = self.client.get("/records/user-a?limit=2&offset=2", headers=self.auth_headers())
+
+        self.assertEqual(first_page.status_code, 200)
+        self.assertEqual([record["client_record_id"] for record in first_page.get_json()["records"]], ["record-3", "record-2"])
+        self.assertEqual([record["client_record_id"] for record in second_page.get_json()["records"]], ["record-1"])
+
+    def test_record_update_trims_names_and_recalculates_totals(self):
+        self.app_module.storage.insert_record({
+            "user_id": "user-a",
+            "client_record_id": "editable-record",
+            "timestamp": "2026-08-03T12:00:00Z",
+            "meal_type": "午餐",
+            "foods": [{"name": "原始名稱", "calories": 80}],
+            "total_calories": 80,
+            "source": "nutrition-label",
+        })
+        payload = {
+            "foods": [
+                {"name": "  豆漿  ", "calories": 120, "protein": 8.5, "carbs": 10, "fat": 4, "sodium": 95, "fiber": 2},
+                {"name": "香蕉", "calories": 90, "protein": 1, "carbs": 23, "fat": 0.3, "sodium": 1, "fiber": 2.6},
+            ],
+            "total_calories": 9999,
+        }
+
+        with self.mock_auth("user-a"):
+            response = self.client.patch(
+                "/records/user-a/editable-record",
+                json=payload,
+                headers=self.auth_headers(),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        record = response.get_json()["record"]
+        self.assertEqual(record["foods"][0]["name"], "豆漿")
+        self.assertEqual(record["total_calories"], 210)
+        self.assertEqual(record["total_protein"], 9.5)
+        self.assertEqual(record["total_fiber"], 4.6)
+        self.assertEqual(record["source"], "nutrition-label")
+
+    def test_record_update_rejects_blank_names_invalid_numbers_and_negatives(self):
+        self.app_module.storage.insert_record({
+            "user_id": "user-a",
+            "client_record_id": "invalid-record",
+            "timestamp": "2026-08-03T12:00:00Z",
+            "foods": [{"name": "原始名稱", "calories": 80}],
+        })
+        invalid_foods = (
+            [{"name": "   ", "calories": 80}],
+            [{"name": "豆漿", "calories": "not-a-number"}],
+            [{"name": "豆漿", "calories": -1}],
+        )
+
+        for foods in invalid_foods:
+            with self.subTest(foods=foods):
+                with self.mock_auth("user-a"):
+                    response = self.client.patch(
+                        "/records/user-a/invalid-record",
+                        json={"foods": foods},
+                        headers=self.auth_headers(),
+                    )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("error", response.get_json())
+
+        record = self.app_module.storage.get_record_by_client_record_id("user-a", "invalid-record")
+        self.assertEqual(record["foods"][0]["name"], "原始名稱")
+
+    def test_record_delete_removes_only_authenticated_users_record(self):
+        for user_id in ("user-a", "user-b"):
+            self.app_module.storage.insert_record({
+                "user_id": user_id,
+                "client_record_id": "shared-client-id",
+                "timestamp": "2026-08-03T12:00:00Z",
+                "foods": [{"name": user_id, "calories": 80}],
+            })
+
+        with self.mock_auth("user-a"):
+            response = self.client.delete(
+                "/records/user-a/shared-client-id",
+                headers=self.auth_headers(),
+            )
+            records_response = self.client.get("/records/user-a", headers=self.auth_headers())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(records_response.get_json()["records"], [])
+        self.assertIsNotNone(self.app_module.storage.get_record_by_client_record_id("user-b", "shared-client-id"))
+
+    def test_record_mutations_reject_cross_user_access(self):
+        self.app_module.storage.insert_record({
+            "user_id": "user-b",
+            "client_record_id": "private-record",
+            "timestamp": "2026-08-03T12:00:00Z",
+            "foods": [{"name": "私有紀錄", "calories": 80}],
+        })
+
+        with self.mock_auth("user-a"):
+            update_response = self.client.patch(
+                "/records/user-b/private-record",
+                json={"foods": [{"name": "越權修改", "calories": 1}]},
+                headers=self.auth_headers(),
+            )
+            delete_response = self.client.delete(
+                "/records/user-b/private-record",
+                headers=self.auth_headers(),
+            )
+
+        self.assertEqual(update_response.status_code, 403)
+        self.assertEqual(delete_response.status_code, 403)
+        self.assertIsNotNone(self.app_module.storage.get_record_by_client_record_id("user-b", "private-record"))
+
+    def test_custom_food_route_scopes_food_to_authenticated_user(self):
+        payload = {
+            "user_id": "user-a",
+            "name_zh": "油炸測試豆漿",
+            "nutrition_per_100g": {
+                "calories": 42,
+                "protein": 3.4,
+                "fat": 1.8,
+                "carbs": 4.1,
+                "sugar": 1.2,
+                "sodium": 5,
+            },
+        }
+
+        with self.mock_auth("user-a"):
+            response = self.client.post("/custom-food", json=payload, headers=self.auth_headers())
+
+        self.assertEqual(response.status_code, 201)
+        data = response.get_json()
+        self.assertEqual(data["food"]["user_id"], "user-a")
+        self.assertTrue(data["food"]["is_fried"])
+        self.assertIn("owner_key", data["food"])
+
+        with self.mock_auth("user-a"):
+            list_response = self.client.get("/custom-foods?user_id=user-a", headers=self.auth_headers())
+
+        self.assertEqual(list_response.status_code, 200)
+        list_data = list_response.get_json()
+        self.assertEqual(list_data["count"], 1)
+        self.assertEqual(list_data["foods"][0]["user_id"], "user-a")
+
+    def test_map_food_recommend_requires_google_places_key(self):
+        with patch.dict(os.environ, {"GOOGLE_PLACES_API_KEY": "", "GOOGLE_MAPS_API_KEY": ""}, clear=False):
+            with self.mock_auth("user-a"):
+                response = self.client.get("/map-food-recommend/user-a?budget=150&lat=24.9890&lng=121.3443&radius_km=3&category=all", headers=self.auth_headers())
+        self.assertEqual(response.status_code, 503)
+
+    def test_health_metadata_in_map_food_route(self):
+        fake_restaurants = [
+            {
+                "restaurant_id": "google_place_1",
+                "name": "Healthy Bento",
+                "lat": 24.9891,
+                "lng": 121.3444,
+                "address": "Taipei",
+                "phone": "",
+                "google_place_id": "place_1",
+                "distance_km": 0.02,
+                "tags": ["Google Places", "healthy"],
+                "price_level": 1,
+                "is_open": True,
+                "rating": 4.3,
+                "user_ratings_total": 25,
+                "match_score": 88,
+                "data_source": "google_places",
+                "nutrition_available": False,
+                "recommended_items": [
+                    {
+                        "restaurant_id": "google_place_1",
+                        "restaurant_name": "Healthy Bento",
+                        "item_name": "Chicken bowl",
+                        "price": 120,
+                        "calories": 0,
+                        "protein": 0,
+                        "carbs": 0,
+                        "fat": 0,
+                        "sodium": 0,
+                        "match_score": 88,
+                        "nutrition_available": False,
+                        "reasons": ["Google Places result"],
+                    }
+                ],
+                "filtered_items": [],
+            }
+        ]
+
+        with self.mock_auth("user-a"):
+            with patch("services.healthy_food_service.fetch_google_places_restaurants", return_value=fake_restaurants):
+                response = self.client.get("/map-food-recommend/user-a?budget=150&lat=24.9890&lng=121.3443&radius_km=3&category=all", headers=self.auth_headers())
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["data_source"], "google_places")
+
+    def test_restaurant_summary_uses_profile_disease_and_current_over_target_progress(self):
+        self.app_module.storage.upsert_user(
+            {
+                "user_id": "user-a",
+                "name": "User A",
+                "health_conditions": ["hypertension"],
+                "allergens": [],
+                "daily_calorie_target": 1800,
+            }
+        )
+        self.app_module.storage.insert_record(
+            {
+                "user_id": "user-a",
+                "client_record_id": "over-target-record",
+                "timestamp": app_now().isoformat(),
+                "total_calories": 1900,
+                "total_protein": 80,
+                "total_carbs": 200,
+                "total_fat": 60,
+                "total_sodium": 2300,
+                "total_fiber": 12,
+            }
+        )
+        fake_summary = {
+            "restaurant_type": "便當店",
+            "likely_foods": ["便當"],
+            "recommended_foods": [{"name": "少醬蔬菜餐", "reason": "鈉已超標"}],
+            "price_range_twd": {"min": 100, "max": 150},
+            "budget_fit": "適合",
+            "health_tips": ["醬汁另外放"],
+            "confidence": "medium",
+            "source_note": "test",
+        }
+
+        with self.mock_auth("user-a"):
+            with patch.object(self.app_module, "build_restaurant_ai_summary", return_value=fake_summary) as build_summary:
+                response = self.client.post(
+                    "/map-food-recommend/user-a/restaurant-summary",
+                    json={"restaurant": {"name": "Healthy Bento"}, "budget": 150, "category": "bento"},
+                    headers=self.auth_headers(),
+                )
+
+        self.assertEqual(response.status_code, 200)
+        args = build_summary.call_args.args
+        self.assertEqual(args[3], ["hypertension"])
+        self.assertEqual(args[4]["status"]["sodium"], "over")
+        self.assertEqual(args[4]["over_by"]["sodium"], 300)
+        self.assertIn("hypertension", args[5])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class PaidRouteProtectionTests(ApiTestBase):
+    """會呼叫 Gemini / Places 的路由不能任人打——那是按次計費的。"""
+
+    def setUp(self):
+        super().setUp()
+        self.app_module._paid_api_limiter.reset()
+        self.app_module._general_limiter.reset()
+
+    def test_the_cost_incurring_routes_reject_anonymous_callers(self):
+        for method, path, payload in (
+            ("post", "/ocr/nutrition-label", {"image": "x"}),
+            ("post", "/restaurant/menu", {"name": "某某小吃"}),
+            ("get", "/health/gemini", None),
+        ):
+            with self.subTest(path=path):
+                response = (
+                    self.client.post(path, json=payload)
+                    if method == "post"
+                    else self.client.get(path)
+                )
+                self.assertEqual(response.status_code, 401, f"{path} 沒有擋下未驗證的呼叫")
+
+    def test_a_signed_in_caller_gets_through(self):
+        with self.mock_auth("user-a"):
+            response = self.client.post(
+                "/restaurant/menu", json={}, headers=self.auth_headers()
+            )
+        # 缺少店名是 400，重點是沒有被 401 擋在門外
+        self.assertEqual(response.status_code, 400)
+
+    def test_repeated_calls_are_throttled(self):
+        with self.mock_auth("user-a"):
+            statuses = [
+                self.client.post(
+                    "/restaurant/menu", json={"name": f"店{index}"}, headers=self.auth_headers()
+                ).status_code
+                for index in range(40)
+            ]
+        self.assertIn(429, statuses, "限流沒有生效")
+
+    def test_the_throttle_response_says_when_to_retry(self):
+        with self.mock_auth("user-a"):
+            last = None
+            for index in range(40):
+                last = self.client.post(
+                    "/restaurant/menu", json={"name": f"店{index}"}, headers=self.auth_headers()
+                )
+                if last.status_code == 429:
+                    break
+        self.assertEqual(last.status_code, 429)
+        self.assertIn("Retry-After", last.headers)
+
+
+class AuthDefaultTests(unittest.TestCase):
+    """預設就要驗證。先前只有偵測到 RENDER 才驗證，其他部署方式全部不設防。"""
+
+    def setUp(self):
+        self.saved = {
+            key: os.environ.pop(key, None) for key in ("SUPABASE_AUTH_REQUIRED", "RENDER")
+        }
+
+    def tearDown(self):
+        for key, value in self.saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_auth_is_required_when_nothing_is_configured(self):
+        from services.auth_service import is_auth_required
+
+        self.assertTrue(is_auth_required())
+
+    def test_it_can_still_be_turned_off_explicitly_for_local_work(self):
+        from services.auth_service import is_auth_required
+
+        os.environ["SUPABASE_AUTH_REQUIRED"] = "false"
+        self.assertFalse(is_auth_required())
+
+
+class VenueIndexListingTests(ApiTestBase):
+    """建檔完只回一個數字的話，出問題只能翻伺服器 log。"""
+
+    def _index_one(self):
+        places = [{
+            "restaurant_id": "google_p1", "name": "阿美飯館", "lat": 25.0338, "lng": 121.5645,
+            "address": "台北", "tags": ["Google Places"], "google_place_id": "p1",
+            "distance_km": 0.2, "match_score": 70, "is_open": True,
+            "opening_periods": [{"day": 1, "open_minute": 600, "close_minute": 1200}],
+        }]
+        with patch.object(self.app_module, "fetch_google_places_restaurants", lambda *a, **k: places), \
+             patch.object(self.app_module, "enrich_restaurant_with_gemini", self._seed_menu):
+            self.client.post("/restaurants/index/user-a", json={}, headers=self.auth_headers())
+
+    def test_the_indexed_venues_can_be_listed(self):
+        with self.mock_auth("user-a"):
+            self._index_one()
+            data = self.client.get(
+                "/restaurants/index/user-a", headers=self.auth_headers()
+            ).get_json()
+
+        self.assertEqual(data["count"], 1)
+        venue = data["venues"][0]
+        self.assertEqual(venue["name"], "阿美飯館")
+        self.assertGreater(venue["items"], 0)
+        self.assertTrue(venue["has_opening_hours"])
+        self.assertFalse(venue["stale"])
+
+    def test_listing_requires_the_owning_user(self):
+        with self.mock_auth("user-b"):
+            response = self.client.get("/restaurants/index/user-a", headers=self.auth_headers())
+        self.assertEqual(response.status_code, 403)
+
+    def test_an_empty_index_lists_nothing_rather_than_failing(self):
+        with self.mock_auth("user-a"):
+            data = self.client.get(
+                "/restaurants/index/user-a", headers=self.auth_headers()
+            ).get_json()
+        self.assertEqual(data["count"], 0)
+        self.assertEqual(data["venues"], [])
+
+
+class AllowedOriginNormalisationTests(unittest.TestCase):
+    """Render 給的是不帶協定的主機名，CORS 比對的是完整 origin。"""
+
+    def setUp(self):
+        import app as app_module
+
+        self.normalise = app_module._normalise_origin
+
+    def test_a_bare_hostname_becomes_an_https_origin(self):
+        self.assertEqual(self.normalise("nutrilens-web.onrender.com"), "https://nutrilens-web.onrender.com")
+
+    def test_an_explicit_scheme_is_left_alone(self):
+        self.assertEqual(self.normalise("https://example.com"), "https://example.com")
+        self.assertEqual(self.normalise("http://example.com"), "http://example.com")
+
+    def test_localhost_stays_on_http(self):
+        self.assertEqual(self.normalise("localhost:8081"), "http://localhost:8081")
+
+    def test_a_trailing_slash_is_dropped(self):
+        """origin 比對不含結尾斜線，多一個就永遠對不上。"""
+        self.assertEqual(self.normalise("https://example.com/"), "https://example.com")
+
+    def test_blank_entries_are_dropped(self):
+        self.assertEqual(self.normalise("   "), "")
+
+
+class PostgresSslModeTests(unittest.TestCase):
+    """本機 Postgres 預設沒開 SSL；寫死 sslmode=require 就連不上。"""
+
+    def setUp(self):
+        import app as app_module
+
+        self.connect = app_module.connect_postgres
+        self.module = app_module
+
+    def _captured(self, url):
+        seen = {}
+
+        def fake_connect(dsn, **kwargs):
+            seen["dsn"] = dsn
+            seen["kwargs"] = kwargs
+            return object()
+
+        with patch.object(self.module.psycopg2, "connect", fake_connect):
+            self.connect(url)
+        return seen
+
+    def test_a_local_database_does_not_demand_ssl(self):
+        seen = self._captured("postgresql://user:pw@localhost:5432/nutrilens")
+        self.assertEqual(seen["kwargs"].get("sslmode"), "prefer")
+
+    def test_a_remote_database_still_requires_ssl(self):
+        seen = self._captured("postgresql://user:pw@aws-1.pooler.supabase.com:5432/postgres")
+        self.assertEqual(seen["kwargs"].get("sslmode"), "require")
+
+    def test_an_explicit_sslmode_in_the_url_wins(self):
+        seen = self._captured("postgresql://user:pw@example.com/db?sslmode=disable")
+        self.assertNotIn("sslmode", seen["kwargs"])
+
+    def test_docker_compose_hostnames_count_as_local(self):
+        for url in ("postgresql://u:p@db:5432/nutrilens",
+                    "postgresql://u:p@host.docker.internal:5432/nutrilens"):
+            with self.subTest(url=url):
+                self.assertEqual(self._captured(url)["kwargs"].get("sslmode"), "prefer")
